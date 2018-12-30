@@ -1,50 +1,26 @@
-/***************************************************************************
-  This is a library for the AMG88xx GridEYE 8x8 IR camera
-
-  This sketch makes a 64 pixel thermal camera with the GridEYE sensor
-  and a 128x128 tft screen https://www.adafruit.com/product/2088
-
-  Designed specifically to work with the Adafruit AMG88 breakout
-  ----> http://www.adafruit.com/products/3538
-
-  These sensors use I2C to communicate. The device's I2C address is 0x69
-
-  Adafruit invests time and resources providing this open source code,
-  please support Adafruit andopen-source hardware by purchasing products
-  from Adafruit!
-
-  Written by Dean Miller & James DeVito for Adafruit Industries.
-  BSD license, all text above must be included in any redistribution
- ***************************************************************************/
-
-#include <Adafruit_GFX.h>
-#include <Adafruit_AMG88xx.h>
-#include <Adafruit_ST7735.h>
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ST7735.h> // Hardware-specific library for ST7735
 #include "Adafruit_miniTFTWing.h"
+#include <Adafruit_AMG88xx.h>
+#include "Adafruit_Si7021.h"
 #include "debugprint.h"
-
-Adafruit_miniTFTWing ss;
 
 #define TFT_RST  -1    // we use the seesaw for resetting to save a pin
 #define TFT_CS    8
 #define TFT_DC    3
-
-Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
-
-uint16_t displayPixelWidth = 10;
-uint16_t displayPixelHeight = 10;
-
-//low range of the sensor (this will be blue on the screen)
 #define MINTEMP 15
-
-//high range of the sensor (this will be red on the screen)
 #define MAXTEMP 35
+#define AMG_COLS 8
+#define AMG_ROWS 8
+#define INTERPOLATED_COLS 40
+#define INTERPOLATED_ROWS 40
 
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS,  TFT_DC, TFT_RST);
+Adafruit_miniTFTWing ss;
 Adafruit_AMG88xx amg;
 
-float pixels[AMG88xx_PIXEL_ARRAY_SIZE];
+float pixels[AMG_COLS * AMG_ROWS];
 
-//the colors we will be using
 const uint16_t camColors[] = {0x480F,
                               0x400F, 0x400F, 0x400F, 0x4010, 0x3810, 0x3810, 0x3810, 0x3810, 0x3010, 0x3010,
                               0x3010, 0x2810, 0x2810, 0x2810, 0x2810, 0x2010, 0x2010, 0x2010, 0x1810, 0x1810,
@@ -74,22 +50,32 @@ const uint16_t camColors[] = {0x480F,
                               0xF080, 0xF060, 0xF040, 0xF020, 0xF800,
                              };
 
+float get_point(float *p, uint8_t rows, uint8_t cols, int8_t x, int8_t y);
+void set_point(float *p, uint8_t rows, uint8_t cols, int8_t x, int8_t y, float f);
+void get_adjacents_1d(float *src, float *dest, uint8_t rows, uint8_t cols, int8_t x, int8_t y);
+void get_adjacents_2d(float *src, float *dest, uint8_t rows, uint8_t cols, int8_t x, int8_t y);
+float cubicInterpolate(float p[], float x);
+float bicubicInterpolate(float p[], float x, float y);
+void interpolate_image(float *src, uint8_t src_rows, uint8_t src_cols, 
+                       float *dest, uint8_t dest_rows, uint8_t dest_cols);
+                       
 void setup() {
   delay(500);
 
   Serial.begin(115200);
 
-  delay(3000);
+  //while ( !Serial )
+  //  delay(200);
 
-  debugprint(DEBUG_INFO, "Mini Thermal Cam V0.1");
+  debugprint(DEBUG_INFO, "Mini Thermal Cam V0.2");
 
   // Set up the Seesaw
   if ( !ss.begin() ) {
     debugprint(DEBUG_ERROR, "seesaw init error!");
-    while (1);
+    while (true);
   }
 
-  debugprint(DEBUG_INFO, "Seesaw initialized");
+  debugprint(DEBUG_INFO, "Seesaw initialized!");
   ss.tftReset();
   ss.setBacklight(0x0); //set the backlight fully on
   
@@ -100,66 +86,69 @@ void setup() {
   
   debugprint(DEBUG_INFO, "TFT initialized!");
 
+  // Draw the splash screen
+  tft.setCursor(0, 0);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setTextWrap(true);
+  tft.println("Mini Thermal Cam V0.1");
+
   // Set up the thermal sensor
   if ( !amg.begin() ) {
     debugprint(DEBUG_ERROR, "Could not find a valid AMG88xx sensor, check wiring!");
     while (1);
   }
 
+  tft.println("Thermal Sensor initialized!");
   debugprint(DEBUG_INFO, "Thermal Sensor initialized!");
 
-  // Draw the splash screen
-  tft.setCursor(0, 0);
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextWrap(true);
-  tft.print("Mini Thermal Cam V0.1");
+  // Let the boot screen show for a second...
   delay(1000);
-
   tft.fillScreen(ST77XX_BLACK);
-  
+
   Debug = DEBUG_ERROR | DEBUG_WARN | DEBUG_INFO;
+  //Debug = DEBUG_ALL;
 }
 
 void loop() {
 
-  // Read the sensor...
+  //read all the pixels
   debugprint(DEBUG_TRACE, "Reading pixels...");
   amg.readPixels(pixels);
 
-  // Draw the pixels...
-  int pixel = 0;
+  float dest_2d[INTERPOLATED_ROWS * INTERPOLATED_COLS];
 
-  for ( int x = tft.width() / 2 - displayPixelWidth + 1; x > 0; x -= displayPixelWidth ) {
+  int32_t t = millis();
+  interpolate_image(pixels, AMG_ROWS, AMG_COLS, dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS);
+  debugprint(DEBUG_TRACE, "Interpolation took %d ms", millis() - t );
 
-    for ( int y = 0; y < tft.height() - displayPixelHeight + 1; y += displayPixelHeight ) {
+  uint16_t boxsize = min(tft.width() / INTERPOLATED_COLS, tft.height() / INTERPOLATED_COLS);
+  
+  drawpixels(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, boxsize, boxsize);
+}
 
-      int colorTemp;
-      if ( pixels[pixel] >= MAXTEMP ) {
+void drawpixels(float *p, uint8_t rows, uint8_t cols, uint8_t boxWidth, uint8_t boxHeight) {
+
+  int colorTemp;
+
+  for ( int row = 0; row < rows; row++ ) {
+
+    for ( int col = 0; col < cols; col++ ) {
+
+      float val = get_point(p, rows, cols, row, col);
+
+      if ( val >= MAXTEMP )
         colorTemp = MAXTEMP;
-      }
-      else if (pixels[pixel] <= MINTEMP) {
+      else if ( val <= MINTEMP )
         colorTemp = MINTEMP;
-      }
-      else {
-        colorTemp = pixels[pixel];
-      }
-
+      else
+        colorTemp = val;
+      
       uint8_t colorIndex = map(colorTemp, MINTEMP, MAXTEMP, 0, 255);
-
       colorIndex = constrain(colorIndex, 0, 255);
 
-      debugprint(DEBUG_TRACE, "pixel: %d x: %d y: %d COLOR: %04X",
-                 pixel, x, y, camColors[colorIndex]);
-
       //draw the pixels!
-      // void fillRect(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, uint16_t color);
-      tft.fillRect(x + 40, y, displayPixelWidth, displayPixelHeight, camColors[colorIndex]);
-
-      if ( ++pixel > AMG88xx_PIXEL_ARRAY_SIZE )
-        pixel = 0;
-
-    } // next y
-
-  } // next x
-
+      tft.fillRect( 40 + boxWidth * col, boxHeight * row, boxWidth, boxHeight, camColors[colorIndex]);
+        
+    } // next col
+  } // next row
 }
