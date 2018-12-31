@@ -10,16 +10,21 @@
 #define TFT_DC    3
 #define ABS_MINTEMP 0
 #define ABS_MAXTEMP 80
+#define MIN_TEMP_RANGE 10
 #define DEFAULT_MINTEMP 15
 #define DEFAULT_MAXTEMP 30
 #define AMG_COLS 8
 #define AMG_ROWS 8
 #define INTERPOLATED_COLS 40
 #define INTERPOLATED_ROWS 40
+#define KEYPAD_INTERRUPT_INTERVAL 100000 // check every 100ms
 
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS,  TFT_DC, TFT_RST);
 Adafruit_miniTFTWing ss;
 Adafruit_AMG88xx amg;
+
+IntervalTimer keypadTimer;
+uint32_t oldButtons;
 
 float pixels[AMG_COLS * AMG_ROWS];
 
@@ -111,6 +116,9 @@ void setup() {
   debugprint(DEBUG_INFO, "Thermal Sensor initialized!");
   tft.println("Thermal Sensor initialized!");
 
+  // Set up the keypad timer interrupt...
+  keypadTimer.begin(checkKeypad, KEYPAD_INTERRUPT_INTERVAL);
+
   // Let the boot screen show for a second...
   delay(1000);
   tft.fillScreen(ST77XX_BLACK);
@@ -121,9 +129,14 @@ void setup() {
 
 void loop() {
 
-  //read all the pixels
+  // Read the thermal sensor...
   debugprint(DEBUG_TRACE, "Reading pixels...");
+
+  // Disable interrupts, as interrupting the read call
+  // seems to introduce errors into the thermal image data...
+  noInterrupts();
   amg.readPixels(pixels);
+  interrupts();  
 
   float dest_2d[INTERPOLATED_ROWS * INTERPOLATED_COLS];
 
@@ -133,9 +146,6 @@ void loop() {
 
   uint16_t boxsize = min(tft.width() / INTERPOLATED_COLS, tft.height() / INTERPOLATED_COLS);
   
-  // Read the keypad...
-  do_keypad();
-  
   // Update the screen...
   drawScale(get_point(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, INTERPOLATED_ROWS / 2, INTERPOLATED_COLS / 2));
   drawPixels(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, boxsize, boxsize);
@@ -143,6 +153,7 @@ void loop() {
 }
 
 int units(int inDegrees, bool returnImperial) {
+  
   if ( returnImperial ) {
     return (inDegrees * 9/5) + 32;
   }
@@ -241,11 +252,12 @@ void drawPixels(float *p, uint8_t rows, uint8_t cols, uint8_t boxWidth, uint8_t 
   } // next row
 }
 
-void do_keypad() {
+void checkKeypad() {
 
   uint32_t buttons = ss.readButtons();
 
-  if ( !buttons )
+  // Bail out if the same buttons are still down from last time...
+  if ( buttons == oldButtons )
     return;
 
   if (! (buttons & TFTWING_BUTTON_LEFT)) {
@@ -269,19 +281,53 @@ void do_keypad() {
   if (! (buttons & TFTWING_BUTTON_SELECT)) {
     resetRange();
   }
+
+  oldButtons = buttons;
 }
 
 void moveMidpoint( int distance ) {
-  minTemp = min(minTemp + distance, ABS_MINTEMP);
-  maxTemp + max(maxTemp + distance, ABS_MAXTEMP);
+  
+  if ( distance < 0 ) { // going down?
+    if ( minTemp + distance >= ABS_MINTEMP )
+      minTemp += distance;
+    if ( maxTemp + distance >= ABS_MINTEMP + MIN_TEMP_RANGE )
+      maxTemp += distance;
+  }
+  else if ( distance > 0 ) { // going up?
+    if ( minTemp + distance <= ABS_MAXTEMP - MIN_TEMP_RANGE )
+      minTemp += distance;
+    if ( maxTemp + distance <= ABS_MAXTEMP )
+      maxTemp += distance;
+  }
+  else { // going nowhere?!?
+    debugprint(DEBUG_ERROR, "moveMidpoint(): Invalid distance: %d", distance);    
+  }
+
   debugprint(DEBUG_INFO, "midpoint += %d\n", distance);
 }
 
 void moveRange( int distance ) {
   debugprint(DEBUG_INFO, "\nbefore: minTemp = %d; maxTemp = %d", minTemp, maxTemp);
 
-  maxTemp += distance;
-  minTemp -= distance;
+  if ( distance < 0 ) { // reducing range?
+    // Range-check the range...
+    if ( (maxTemp + distance) - (minTemp - distance) >= MIN_TEMP_RANGE ) {
+      minTemp -= distance;
+      maxTemp += distance;
+    }
+    // range-check the endpoints?
+  }
+  else if ( distance > 0 ) { // increasing range?
+    // Range-check the endpoints...
+    if ( minTemp - distance >= ABS_MINTEMP and maxTemp + distance < ABS_MAXTEMP ) {
+      minTemp -= distance;
+      maxTemp += distance;
+    }
+    // Max range is only 80 degrees C, so no need to range-check the range
+  }
+  else { // then why did you wake me up?!?
+    debugprint(DEBUG_ERROR, "moveRange(): Invalid distance: %d", distance);    
+  }
 
   debugprint(DEBUG_INFO, "after: minTemp = %d; maxTemp = %d\n", minTemp, maxTemp);
 }
