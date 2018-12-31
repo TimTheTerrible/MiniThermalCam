@@ -1,5 +1,5 @@
-#include <Adafruit_GFX.h>    // Core graphics library
-#include <Adafruit_ST7735.h> // Hardware-specific library for ST7735
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
 #include "Adafruit_miniTFTWing.h"
 #include <Adafruit_AMG88xx.h>
 #include "Adafruit_Si7021.h"
@@ -8,8 +8,10 @@
 #define TFT_RST  -1    // we use the seesaw for resetting to save a pin
 #define TFT_CS    8
 #define TFT_DC    3
-#define MINTEMP 15
-#define MAXTEMP 35
+#define ABS_MINTEMP 0
+#define ABS_MAXTEMP 80
+#define DEFAULT_MINTEMP 15
+#define DEFAULT_MAXTEMP 30
 #define AMG_COLS 8
 #define AMG_ROWS 8
 #define INTERPOLATED_COLS 40
@@ -20,6 +22,12 @@ Adafruit_miniTFTWing ss;
 Adafruit_AMG88xx amg;
 
 float pixels[AMG_COLS * AMG_ROWS];
+
+bool displayHold = false;
+bool displayUnitsImperial = false;
+
+int minTemp = DEFAULT_MINTEMP;
+int maxTemp = DEFAULT_MAXTEMP;
 
 const uint16_t camColors[] = {0x480F,
                               0x400F, 0x400F, 0x400F, 0x4010, 0x3810, 0x3810, 0x3810, 0x3810, 0x3010, 0x3010,
@@ -94,12 +102,14 @@ void setup() {
 
   // Set up the thermal sensor
   if ( !amg.begin() ) {
-    debugprint(DEBUG_ERROR, "Could not find a valid AMG88xx sensor, check wiring!");
+    debugprint(DEBUG_ERROR, "Couldn't find a valid AMG88xx sensor, check wiring!");
+    tft.setTextColor(ST77XX_RED);
+    tft.println("Couldn't find a valid AMG88xx sensor, check wiring!");
     while (1);
   }
 
-  tft.println("Thermal Sensor initialized!");
   debugprint(DEBUG_INFO, "Thermal Sensor initialized!");
+  tft.println("Thermal Sensor initialized!");
 
   // Let the boot screen show for a second...
   delay(1000);
@@ -123,10 +133,81 @@ void loop() {
 
   uint16_t boxsize = min(tft.width() / INTERPOLATED_COLS, tft.height() / INTERPOLATED_COLS);
   
-  drawpixels(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, boxsize, boxsize);
+  // Read the keypad...
+  do_keypad();
+  
+  // Update the screen...
+  drawScale(get_point(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, INTERPOLATED_ROWS / 2, INTERPOLATED_COLS / 2));
+  drawPixels(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, boxsize, boxsize);
+  drawUI();
 }
 
-void drawpixels(float *p, uint8_t rows, uint8_t cols, uint8_t boxWidth, uint8_t boxHeight) {
+int units(int inDegrees, bool returnImperial) {
+  if ( returnImperial ) {
+    return (inDegrees * 9/5) + 32;
+  }
+  else {
+    return inDegrees;
+  }
+}
+
+void drawScale(int targetTemp) {
+
+  for ( int row = tft.height(); row > 0; row-- ) {
+    tft.drawFastHLine(0, row, 39, camColors[map(row, tft.height(), 0, 0, 255)]);
+  }
+  
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(5, 5);
+  tft.println(units(maxTemp, displayUnitsImperial));
+  tft.setCursor(5, 35);
+  tft.println(units(targetTemp, displayUnitsImperial));
+  tft.setCursor(5, 65);
+  tft.println(units(minTemp, displayUnitsImperial));
+}
+
+void drawUI() {
+  /*      121                  159
+   *    0 +--------------------+
+   *      |    battery icon    |
+   *   20 +--------------------+
+   *      |        units       |
+   *   40 +--------------------+
+   *      |                    |
+   *      |      disk icon     |
+   *      |                    |
+   *   79 +--------------------+
+   */
+
+  // draw a battery
+  tft.drawRect(125, 5, 30, 10, ST77XX_WHITE);
+  tft.fillRect(155, 7, 3, 5, ST77XX_WHITE);
+
+  // Draw the units
+  // Draw the old value in black to erase it,
+  // then draw the new one in white.
+  tft.setTextSize(2);
+  if ( displayUnitsImperial ) {
+    tft.setTextColor(ST77XX_BLACK);
+    tft.setCursor(135, 25);
+    tft.println("C");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(135, 25);
+    tft.println("F");
+  }
+  else {
+    tft.setTextColor(ST77XX_BLACK);
+    tft.setCursor(135, 25);
+    tft.println("F");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(135, 25);
+    tft.println("C");
+  }
+
+}
+
+void drawPixels(float *p, uint8_t rows, uint8_t cols, uint8_t boxWidth, uint8_t boxHeight) {
 
   int colorTemp;
 
@@ -136,19 +217,77 @@ void drawpixels(float *p, uint8_t rows, uint8_t cols, uint8_t boxWidth, uint8_t 
 
       float val = get_point(p, rows, cols, row, col);
 
-      if ( val >= MAXTEMP )
-        colorTemp = MAXTEMP;
-      else if ( val <= MINTEMP )
-        colorTemp = MINTEMP;
+      if ( val >= maxTemp )
+        colorTemp = maxTemp;
+      else if ( val <= minTemp )
+        colorTemp = minTemp;
       else
         colorTemp = val;
       
-      uint8_t colorIndex = map(colorTemp, MINTEMP, MAXTEMP, 0, 255);
+      uint8_t colorIndex = map(colorTemp, minTemp, maxTemp, 0, 255);
       colorIndex = constrain(colorIndex, 0, 255);
 
       //draw the pixels!
-      tft.fillRect( 40 + boxWidth * col, boxHeight * row, boxWidth, boxHeight, camColors[colorIndex]);
+      if ( row == rows / 2 && col == cols / 2 ) {
+        // we're drawing the target
+        colorTemp = ST77XX_WHITE;
+      }
+      else {
+        colorTemp = camColors[colorIndex];
+      }
+      tft.fillRect( 40 + boxWidth * col, boxHeight * row, boxWidth, boxHeight, colorTemp);
         
     } // next col
   } // next row
+}
+
+void do_keypad() {
+
+  uint32_t buttons = ss.readButtons();
+
+  if ( !buttons )
+    return;
+
+  if (! (buttons & TFTWING_BUTTON_LEFT)) {
+    moveMidpoint(-1);
+  }
+  if (! (buttons & TFTWING_BUTTON_RIGHT)) {
+    moveMidpoint(+1);
+  }
+  if (! (buttons & TFTWING_BUTTON_DOWN)) {
+    moveRange(-1);
+  }
+  if (! (buttons & TFTWING_BUTTON_UP)) {
+    moveRange(+1);
+  }
+  if (! (buttons & TFTWING_BUTTON_A)) {
+    displayUnitsImperial = !displayUnitsImperial;
+  }
+  if (! (buttons & TFTWING_BUTTON_B)) {
+    displayHold = !displayHold;
+  }
+  if (! (buttons & TFTWING_BUTTON_SELECT)) {
+    resetRange();
+  }
+}
+
+void moveMidpoint( int distance ) {
+  minTemp = min(minTemp + distance, ABS_MINTEMP);
+  maxTemp + max(maxTemp + distance, ABS_MAXTEMP);
+  debugprint(DEBUG_INFO, "midpoint += %d\n", distance);
+}
+
+void moveRange( int distance ) {
+  debugprint(DEBUG_INFO, "\nbefore: minTemp = %d; maxTemp = %d", minTemp, maxTemp);
+
+  maxTemp += distance;
+  minTemp -= distance;
+
+  debugprint(DEBUG_INFO, "after: minTemp = %d; maxTemp = %d\n", minTemp, maxTemp);
+}
+
+void resetRange() {
+  minTemp = DEFAULT_MINTEMP;
+  maxTemp = DEFAULT_MAXTEMP;
+  debugprint(DEBUG_INFO, "min and max reset to %d and %d\n", minTemp, maxTemp);
 }
