@@ -5,9 +5,15 @@
 #include "Adafruit_Si7021.h"
 #include "debugprint.h"
 
-#define TFT_RST  -1    // we use the seesaw for resetting to save a pin
-#define TFT_CS    8
-#define TFT_DC    3
+// Teensy 3.2
+//#define TFT_CS    8
+//#define TFT_DC    3
+
+// Adafruit WICED Feather
+#define TFT_CS    5
+#define TFT_DC    6
+
+#define TFT_RST  -1
 #define ABS_MINTEMP 0
 #define ABS_MAXTEMP 80
 #define MIN_TEMP_RANGE 10
@@ -18,13 +24,16 @@
 #define INTERPOLATED_COLS 40
 #define INTERPOLATED_ROWS 40
 #define KEYPAD_INTERRUPT_INTERVAL 100000 // check every 100ms
+#define BATTERY_DIVIDER A0
 
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS,  TFT_DC, TFT_RST);
 Adafruit_miniTFTWing ss;
 Adafruit_AMG88xx amg;
 
-IntervalTimer keypadTimer;
+//IntervalTimer keypadTimer;
 uint32_t oldButtons;
+
+uint32_t batteryLevelRaw;
 
 float pixels[AMG_COLS * AMG_ROWS];
 
@@ -117,39 +126,71 @@ void setup() {
   tft.println("Thermal Sensor initialized!");
 
   // Set up the keypad timer interrupt...
-  keypadTimer.begin(checkKeypad, KEYPAD_INTERRUPT_INTERVAL);
+  //keypadTimer.begin(checkKeypad, KEYPAD_INTERRUPT_INTERVAL);
 
   // Let the boot screen show for a second...
   delay(1000);
   tft.fillScreen(ST77XX_BLACK);
 
+  // Set up the battery monitor
+  pinMode(BATTERY_DIVIDER, INPUT);
+
   Debug = DEBUG_ERROR | DEBUG_WARN | DEBUG_INFO;
   //Debug = DEBUG_ALL;
 }
+
+// Let's do some profiling...
+int32_t reportInterval = 1000;
+int32_t reportTime = 0;
+int32_t loopCount = 0;
+int32_t readTime = 0;
+int32_t interpTime = 0;
+int32_t drawTime = 0;
 
 void loop() {
 
   // Read the thermal sensor...
   debugprint(DEBUG_TRACE, "Reading pixels...");
 
+  int32_t t = millis();
   // Disable interrupts, as interrupting the read call
   // seems to introduce errors into the thermal image data...
   noInterrupts();
   amg.readPixels(pixels);
   interrupts();  
+  //debugprint(DEBUG_INFO, "Sensor read took %d ms", millis() - t);
+  readTime += millis() - t;
 
   float dest_2d[INTERPOLATED_ROWS * INTERPOLATED_COLS];
 
-  int32_t t = millis();
+  t = millis();
   interpolate_image(pixels, AMG_ROWS, AMG_COLS, dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS);
-  debugprint(DEBUG_TRACE, "Interpolation took %d ms", millis() - t );
+  //debugprint(DEBUG_INFO, "Interpolation took %d ms", millis() - t );
+  interpTime += millis() - t;
 
   uint16_t boxsize = min(tft.width() / INTERPOLATED_COLS, tft.height() / INTERPOLATED_COLS);
   
+  t = millis();
   // Update the screen...
   drawScale(get_point(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, INTERPOLATED_ROWS / 2, INTERPOLATED_COLS / 2));
   drawPixels(dest_2d, INTERPOLATED_ROWS, INTERPOLATED_COLS, boxsize, boxsize);
   drawUI();
+  //debugprint(DEBUG_INFO, "UI Draw took %d ms", millis() - t );
+  drawTime += millis() - t;
+
+  if ( millis() > reportTime ) {
+    debugprint(DEBUG_INFO, "Iterations: %d", loopCount);
+    debugprint(DEBUG_INFO, "Avg read time: %d", readTime / loopCount);
+    debugprint(DEBUG_INFO, "Avg interp time: %d", interpTime / loopCount);
+    debugprint(DEBUG_INFO, "Avg draw time: %d", drawTime / loopCount);
+    reportTime = millis() + reportInterval;
+
+    batteryLevelRaw = analogRead(BATTERY_DIVIDER);
+    debugprint(DEBUG_INFO, "Battery divider value: %d", batteryLevelRaw);
+  }
+  loopCount++;
+
+  checkKeypad();
 }
 
 int units(int inDegrees, bool returnImperial) {
@@ -194,6 +235,14 @@ void drawUI() {
   // draw a battery
   tft.drawRect(125, 5, 30, 10, ST77XX_WHITE);
   tft.fillRect(155, 7, 3, 5, ST77XX_WHITE);
+  tft.fillRect(126, 6, 28, 8, ST77XX_BLACK);
+  tft.fillRect(127, 7, map(batteryLevelRaw, 0, 116, 2, 26), 6, ST77XX_WHITE);
+
+  // write out the raw battery level for debugging
+  tft.fillRect(125, 45, 20, 10, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(125, 45);
+  tft.println(batteryLevelRaw);
 
   // Draw the units
   // Draw the old value in black to erase it,
